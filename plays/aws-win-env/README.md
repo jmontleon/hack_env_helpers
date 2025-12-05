@@ -7,18 +7,18 @@ This playbook is intended to provide an easily deployable Windows instance in AW
 
 ## Prerequisites
 If on Fedora:
-```
+```bash
 sudo dnf -y install ansible python3-winrm python3-boto3
 ```
 
 On other platforms:
-```
+```bash
 pip install ansible pywinrm
 ansible-galaxy collection install amazon.aws
 ```
 
 ## Usage:
-```
+```bash
 ansible-playbook ./ansible-windows-extension.yml \
   -e aws_access_key_id=$AWS_ACCESS_KEY_ID \
   -e aws_secret_access_key=$AWS_SECRET_ACCESS_KEY \
@@ -28,8 +28,20 @@ ansible-playbook ./ansible-windows-extension.yml \
   -e disable_http2=true
 ```
 
-## To clean up
+By default the latest Konveyor AI release, excluding pre-releases will be installed. If you need an alternate version provide a link to the vsix
+```bash
+ansible-playbook ./ansible-windows-extension.yml \
+  -e aws_access_key_id=$AWS_ACCESS_KEY_ID \
+  -e aws_secret_access_key=$AWS_SECRET_ACCESS_KEY \
+  -e gh_token=$GH_TOKEN \
+  -e action=deploy \
+  -e guid=$USER-win2025 \
+  -e disable_http2=true \
+  -e https://github.com/migtools/editor-extensions/releases/download/development-builds/mta-vscode-extension-8.0.0-dev.20251124223200.c332c41.vsix
 ```
+
+## To clean up
+```bash
 ansible-playbook ./ansible-windows-extension.yml \
   -e aws_access_key_id=$AWS_ACCESS_KEY_ID \
   -e aws_secret_access_key=$AWS_SECRET_ACCESS_KEY \
