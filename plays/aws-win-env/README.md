@@ -28,6 +28,18 @@ ansible-playbook ./ansible-windows-extension.yml \
   -e disable_http2=true
 ```
 
+By default the latest Konveyor AI release, excluding pre-releases will be installed. If you need an alternate version provide a link to the vsix
+``
+ansible-playbook ./ansible-windows-extension.yml \`
+  -e aws_access_key_id=$AWS_ACCESS_KEY_ID \
+  -e aws_secret_access_key=$AWS_SECRET_ACCESS_KEY \
+  -e gh_token=$GH_TOKEN \
+  -e action=deploy \
+  -e guid=$USER-win2025 \
+  -e disable_http2=true \
+  -e https://github.com/migtools/editor-extensions/releases/download/development-builds/mta-vscode-extension-8.0.0-dev.20251124223200.c332c41.vsix
+```
+
 ## To clean up
 ```
 ansible-playbook ./ansible-windows-extension.yml \
