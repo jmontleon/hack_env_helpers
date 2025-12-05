@@ -330,6 +330,7 @@
             windows_instance_id: "{{ instance_id }}"
             windows_instance_ip: "{{ instance_ip }}"
             windows_admin_password: "{{ admin_pw.win_password }}"
+            nonadmin_password: "{{ admin_pw.win_password }}"
             cacheable: yes
 
         - name: Add Windows host to inventory
@@ -600,7 +601,7 @@
   vars_files:
     - ./vars
   vars:
-    windows_user: Administrator
+    windows_user: NonAdmin
     windows_password: "{{ ansible_password }}"
     konveyor_extension_url: https://github.com/konveyor/editor-extensions/releases/download/v0.2.0-pre.2-1/konveyor-v0.2.0-pre.2-1.vsix
     github_repos:
@@ -615,6 +616,104 @@
           delay: 5
           register: system_ready
           until: system_ready is succeeded
+
+        - name: Create NonAdmin user account
+          win_user:
+            name: NonAdmin
+            password: "{{ ansible_password }}"
+            password_never_expires: yes
+            state: present
+            groups:
+              - Users
+            description: "Non-administrative user for development"
+
+        - name: Enable RDP access for NonAdmin user
+          win_shell: |
+            # Add NonAdmin to Remote Desktop Users group
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member "NonAdmin" -ErrorAction SilentlyContinue
+
+        - name: Create temp directory if it doesn't exist
+          win_file:
+            path: C:\temp
+            state: directory
+
+        - name: Create C# code file for CreateProfile API
+          win_copy:
+            content: |
+              [DllImport("Userenv.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+              public static extern int CreateProfile(
+                  [MarshalAs(UnmanagedType.LPWStr)] string pszUserSid,
+                  [MarshalAs(UnmanagedType.LPWStr)] string pszUserName,
+                  [MarshalAs(UnmanagedType.LPWStr)] System.Text.StringBuilder pszProfilePath,
+                  uint cchProfilePath
+              );
+            dest: C:\temp\CreateProfile.cs
+
+        - name: Create PowerShell script for profile creation
+          win_copy:
+            content: |
+              $userName = "NonAdmin"
+
+              try {
+                $objUser = New-Object System.Security.Principal.NTAccount($userName)
+                $strSID = $objUser.Translate([System.Security.Principal.SecurityIdentifier])
+                $userSid = $strSID.Value
+                Write-Output "User SID: $userSid"
+              }
+              catch {
+                Write-Error "Failed to get SID for user $userName : $_"
+                exit 1
+              }
+
+              $createProfileCode = Get-Content C:\temp\CreateProfile.cs -Raw
+              Add-Type -Namespace 'Profiles' -Name 'UserProfile' -MemberDefinition $createProfileCode
+
+              $profilePath = New-Object System.Text.StringBuilder 260
+              $result = [Profiles.UserProfile]::CreateProfile($userSid, $userName, $profilePath, $profilePath.Capacity)
+
+              if ($result -eq 0) {
+                $path = $profilePath.ToString()
+                Write-Output "SUCCESS: Profile created at: $path"
+              }
+              elseif ($result -eq 0x800700B7) {
+                Write-Output "Profile already exists"
+                $profile = Get-WmiObject -Class Win32_UserProfile | Where-Object {
+                  $_.LocalPath -like "*\NonAdmin*" -and -not $_.Special
+                } | Select-Object -First 1
+                if ($profile) {
+                  $profilePath = $profile.LocalPath
+                  Write-Output "Existing profile at: $profilePath"
+                }
+              }
+              else {
+                $exception = [System.Runtime.InteropServices.Marshal]::GetExceptionForHR($result)
+                $hexResult = $result.ToString('X8')
+                $errorMsg = $exception.Message
+                Write-Error "Failed to create profile: $errorMsg (HRESULT: 0x$hexResult)"
+                exit 1
+              }
+
+              Start-Sleep -Seconds 2
+              $profile = Get-WmiObject -Class Win32_UserProfile | Where-Object {
+                $_.LocalPath -like "*\NonAdmin*" -and -not $_.Special
+              } | Select-Object -First 1
+
+              if ($profile) {
+                $profilePath = $profile.LocalPath
+                Write-Output "Profile verified at: $profilePath"
+              } else {
+                Write-Error "Profile not found after CreateProfile"
+                exit 1
+              }
+            dest: C:\temp\Create-UserProfile.ps1
+
+        - name: Create user profile using CreateProfile API
+          win_shell: C:\temp\Create-UserProfile.ps1
+          register: profile_creation
+
+        - name: Display profile creation result
+          debug:
+            msg: "{{ profile_creation.stdout_lines }}"
 
         - name: Install Chocolatey
           win_shell: |
@@ -782,7 +881,6 @@
             timeout: 300
           when: konveyor_extension_url is defined and (konveyor_extension_url | lower is match('.*\\.vsix$'))
           register: vsix_download_direct
-          ignore_errors: true
 
         - name: Download Konveyor extension archive (zip)
           win_get_url:
@@ -795,7 +893,6 @@
               Accept: "application/vnd.github+json"
           when: konveyor_extension_url is defined and not (konveyor_extension_url | lower is match('.*\\.vsix$'))
           register: vsix_archive_download
-          ignore_errors: true
 
         - name: Unzip Konveyor extension archive
           win_unzip:
@@ -832,59 +929,168 @@
           register: vsix_file_check
           when: konveyor_extension_url is defined
 
-        - name: Install extensions
+        - name: Download redhat.java extension VSIX
           win_shell: |
-            $codeCandidates = @(
-              "C:\\Program Files\\Microsoft VS Code\\bin\\code.cmd",
-              "C:\\Users\\{{ windows_user }}\\AppData\\Local\\Programs\\Microsoft VS Code\\bin\\code.cmd",
-              "C:\\Program Files (x86)\\Microsoft VS Code\\bin\\code.cmd"
-            )
-            $codeCmd = $codeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-            if (-not $codeCmd) {
-              Write-Error "VSCode CLI (code.cmd) not found in expected locations"
+            $url = "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/redhat/vsextensions/java/latest/vspackage"
+            $dest = "C:\temp\redhat.java.vsix"
+            Write-Output "Downloading from $url"
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing -MaximumRedirection 5
+            Write-Output "Download complete. File size: $((Get-Item $dest).Length) bytes"
+
+        - name: Extract redhat.java extension
+          win_shell: |
+            $profile = Get-WmiObject -Class Win32_UserProfile | Where-Object {
+              $_.LocalPath -like "*\NonAdmin*" -and -not $_.Special
+            } | Select-Object -First 1
+
+            if (-not $profile) {
+              Write-Error "NonAdmin profile not found"
               exit 1
             }
-            $userProfile = [Environment]::GetFolderPath('UserProfile')
-            $appData = [Environment]::GetFolderPath('ApplicationData')
-            $userDataDir = Join-Path $appData 'Code'
-            $extensionsDir = Join-Path $userProfile '.vscode\\extensions'
-            & $codeCmd --version
-            & $codeCmd --user-data-dir "$userDataDir" --extensions-dir "$extensionsDir" --install-extension redhat.java --force
-            if (Test-Path "C:\\temp\\konveyor-extension.vsix") {
-              & $codeCmd --user-data-dir "$userDataDir" --extensions-dir "$extensionsDir" --install-extension "C:\\temp\\konveyor-extension.vsix" --force
-            }
-          register: extension_install
-          failed_when: extension_install.rc != 0
+            $profilePath = $profile.LocalPath
+            Write-Output "Using profile path: $profilePath"
 
-        - name: Configure VSCode settings to disable extension recommendations
+            $vsixPath = "C:\temp\redhat.java.vsix"
+            $zipPath = "C:\temp\redhat.java.zip"
+            $tempExtract = "C:\temp\redhat-java-extracted"
+
+            if (Test-Path $vsixPath) {
+              Write-Output "Renaming VSIX to ZIP for extraction"
+              Copy-Item -Path $vsixPath -Destination $zipPath -Force
+
+              Write-Output "Extracting ZIP from $zipPath to $tempExtract"
+              Expand-Archive -Path $zipPath -DestinationPath $tempExtract -Force
+
+              Write-Output "Extracted VSIX structure:"
+              Get-ChildItem $tempExtract -Recurse -Depth 2 | Select-Object FullName | ForEach-Object { Write-Output $_.FullName }
+
+              if (Test-Path "$tempExtract\extension\package.json") {
+                $packageJsonPath = "$tempExtract\extension\package.json"
+                $sourceDir = "$tempExtract\extension"
+              } elseif (Test-Path "$tempExtract\package.json") {
+                $packageJsonPath = "$tempExtract\package.json"
+                $sourceDir = $tempExtract
+              } else {
+                Write-Error "Could not find package.json in extracted VSIX"
+                exit 1
+              }
+
+              Write-Output "Reading package.json from: $packageJsonPath"
+              $packageJson = Get-Content $packageJsonPath -Raw | ConvertFrom-Json
+              $publisher = $packageJson.publisher
+              $name = $packageJson.name
+              $version = $packageJson.version
+
+              Write-Output "Extension: $publisher.$name version $version"
+
+              $extensionsDir = Join-Path $profilePath ".vscode\extensions"
+              New-Item -Path $extensionsDir -ItemType Directory -Force | Out-Null
+              Write-Output "Created extensions directory: $extensionsDir"
+
+              $extDir = Join-Path $extensionsDir "$publisher.$name-$version"
+              New-Item -Path $extDir -ItemType Directory -Force | Out-Null
+              Write-Output "Created extension directory: $extDir"
+
+              Write-Output "Copying from $sourceDir to $extDir"
+              Copy-Item -Path "$sourceDir\*" -Destination $extDir -Recurse -Force
+              Write-Output "Successfully installed $publisher.$name version $version"
+
+              Write-Output "Verifying installation:"
+              Get-ChildItem $extDir | Select-Object Name | ForEach-Object { Write-Output "  - $($_.Name)" }
+            } else {
+              Write-Error "VSIX file not found at $vsixPath"
+              exit 1
+            }
+
+        - name: Extract konveyor extension if present
           win_shell: |
-            $settingsPath = "C:\Users\{{ windows_user }}\AppData\Roaming\Code\User\settings.json"
-            $settingsDir = Split-Path $settingsPath -Parent
-            
-            if (!(Test-Path $settingsDir)) {
-                New-Item -ItemType Directory -Path $settingsDir -Force
-            }
-            
-            if (!(Test-Path $settingsPath) -or (Get-Content $settingsPath -Raw -ErrorAction SilentlyContinue).Trim() -eq "") {
-                "{}" | Set-Content -Path $settingsPath
-            }
-            
-            $rawJson = Get-Content $settingsPath -Raw
-            $json = $rawJson | ConvertFrom-Json
-            if (-not ($json -is [PSCustomObject])) {
-                $json = [PSCustomObject]@{}
-            }
-            Add-Member -InputObject $json -MemberType NoteProperty -Name "extensions.ignoreRecommendations" -Value $true -Force
-            Add-Member -InputObject $json -MemberType NoteProperty -Name "http.experimental.systemCertificatesV2" -Value $true -Force
+            $profile = Get-WmiObject -Class Win32_UserProfile | Where-Object {
+              $_.LocalPath -like "*\NonAdmin*" -and -not $_.Special
+            } | Select-Object -First 1
 
-            # Configure Java extension to point at installed JDK
+            if (-not $profile) {
+              Write-Error "NonAdmin profile not found"
+              exit 1
+            }
+            $profilePath = $profile.LocalPath
+            Write-Output "Using profile path: $profilePath"
+
+            $vsixPath = "C:\temp\konveyor-extension.vsix"
+            $zipPath = "C:\temp\konveyor-extension.zip"
+            $tempExtract = "C:\temp\konveyor-extracted"
+
+            if (Test-Path $vsixPath) {
+              Write-Output "Renaming Konveyor VSIX to ZIP for extraction"
+              Copy-Item -Path $vsixPath -Destination $zipPath -Force
+
+              Write-Output "Extracting ZIP from $zipPath to $tempExtract"
+              Expand-Archive -Path $zipPath -DestinationPath $tempExtract -Force
+
+              Write-Output "Extracted VSIX structure:"
+              Get-ChildItem $tempExtract -Recurse -Depth 2 | Select-Object FullName | ForEach-Object { Write-Output $_.FullName }
+
+              if (Test-Path "$tempExtract\extension\package.json") {
+                $packageJsonPath = "$tempExtract\extension\package.json"
+                $sourceDir = "$tempExtract\extension"
+              } elseif (Test-Path "$tempExtract\package.json") {
+                $packageJsonPath = "$tempExtract\package.json"
+                $sourceDir = $tempExtract
+              } else {
+                Write-Error "Could not find package.json in extracted Konveyor VSIX"
+                exit 1
+              }
+
+              Write-Output "Reading package.json from: $packageJsonPath"
+              $packageJson = Get-Content $packageJsonPath -Raw | ConvertFrom-Json
+              $publisher = $packageJson.publisher
+              $name = $packageJson.name
+              $version = $packageJson.version
+
+              Write-Output "Extension: $publisher.$name version $version"
+
+              $extensionsDir = Join-Path $profilePath ".vscode\extensions"
+              New-Item -Path $extensionsDir -ItemType Directory -Force | Out-Null
+              Write-Output "Created extensions directory: $extensionsDir"
+
+              $extDir = Join-Path $extensionsDir "$publisher.$name-$version"
+              New-Item -Path $extDir -ItemType Directory -Force | Out-Null
+              Write-Output "Created extension directory: $extDir"
+
+              Write-Output "Copying from $sourceDir to $extDir"
+              Copy-Item -Path "$sourceDir\*" -Destination $extDir -Recurse -Force
+              Write-Output "Successfully installed $publisher.$name version $version"
+
+              Write-Output "Verifying installation:"
+              Get-ChildItem $extDir | Select-Object Name | ForEach-Object { Write-Output "  - $($_.Name)" }
+            } else {
+              Write-Output "Konveyor VSIX not found at $vsixPath, skipping"
+            }
+
+        - name: Create VSCode settings.json for NonAdmin
+          win_shell: |
+            # Get NonAdmin profile path (may have suffix)
+            $profile = Get-WmiObject -Class Win32_UserProfile | Where-Object {
+              $_.LocalPath -like "*\NonAdmin*" -and -not $_.Special
+            } | Select-Object -First 1
+
+            if (-not $profile) {
+              Write-Error "NonAdmin profile not found"
+              exit 1
+            }
+            $profilePath = $profile.LocalPath
+            Write-Output "Using profile path: $profilePath"
+
+            # Create settings directory using actual profile path
+            $settingsDir = Join-Path $profilePath "AppData\Roaming\Code\User"
+            New-Item -Path $settingsDir -ItemType Directory -Force | Out-Null
+
+            $settingsPath = Join-Path $settingsDir "settings.json"
+
+            # Find JAVA_HOME
             $javaHome = [Environment]::GetEnvironmentVariable('JAVA_HOME','Machine')
             if (-not $javaHome -or !(Test-Path $javaHome)) {
-              $candidates = @(
-                'C:\\Program Files\\OpenJDK',
-                'C:\\Program Files\\Microsoft',
-                'C:\\Program Files\\Java'
-              )
+              $candidates = 'C:\Program Files\OpenJDK','C:\Program Files\Microsoft','C:\Program Files\Java'
               foreach ($base in $candidates) {
                 if (Test-Path $base) {
                   $dirs = Get-ChildItem -Path $base -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'jdk' }
@@ -892,50 +1098,140 @@
                 }
               }
             }
-            if ($javaHome -and (Test-Path $javaHome)) {
-              # Set both jdt.ls home and configuration runtimes for robustness
-              Add-Member -InputObject $json -MemberType NoteProperty -Name "java.jdt.ls.java.home" -Value $javaHome -Force
-              $runtime = @(@{ name = 'JavaSE'; path = $javaHome })
-              Add-Member -InputObject $json -MemberType NoteProperty -Name "java.configuration.runtimes" -Value $runtime -Force
-            }
-            $json | ConvertTo-Json -Depth 10 | Set-Content -Path $settingsPath
 
-        - name: Verify extension installation (as non-admin)
+            # Build settings object
+            $settings = @{
+              "extensions.ignoreRecommendations" = $true
+              "http.experimental.systemCertificatesV2" = $true
+            }
+
+            if ($javaHome -and (Test-Path $javaHome)) {
+              $settings["java.jdt.ls.java.home"] = $javaHome
+              $settings["java.configuration.runtimes"] = @(
+                @{
+                  name = "JavaSE"
+                  path = $javaHome
+                }
+              )
+            }
+
+            # Write settings file
+            $settings | ConvertTo-Json -Depth 10 | Set-Content -Path $settingsPath -Force
+
+            Write-Output "Created settings.json at $settingsPath"
+            Get-Content $settingsPath
+          register: vscode_settings_result
+
+        - name: Display VSCode settings configuration result
+          debug:
+            msg: "{{ vscode_settings_result.stdout_lines }}"
+
+        - name: Fix ownership and permissions on VSCode directories
           win_shell: |
-            $codeCandidates = @(
-              "C:\\Program Files\\Microsoft VS Code\\bin\\code.cmd",
-              "C:\\Users\\{{ windows_user }}\\AppData\\Local\\Programs\\Microsoft VS Code\\bin\\code.cmd",
-              "C:\\Program Files (x86)\\Microsoft VS Code\\bin\\code.cmd"
+            # Get NonAdmin profile path (may have suffix)
+            $profile = Get-WmiObject -Class Win32_UserProfile | Where-Object {
+              $_.LocalPath -like "*\NonAdmin*" -and -not $_.Special
+            } | Select-Object -First 1
+
+            if (-not $profile) {
+              Write-Error "NonAdmin profile not found"
+              exit 1
+            }
+            $profilePath = $profile.LocalPath
+
+            $paths = @(
+              (Join-Path $profilePath ".vscode"),
+              (Join-Path $profilePath "AppData\Roaming\Code")
             )
-            $codeCmd = $codeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-            if (-not $codeCmd) { Write-Error "VSCode CLI not found"; exit 1 }
-            $userProfile = [Environment]::GetFolderPath('UserProfile')
-            $appData = [Environment]::GetFolderPath('ApplicationData')
-            $userDataDir = Join-Path $appData 'Code'
-            $extensionsDir = Join-Path $userProfile '.vscode\\extensions'
-            & $codeCmd --user-data-dir "$userDataDir" --extensions-dir "$extensionsDir" --list-extensions
+
+            foreach ($path in $paths) {
+              if (Test-Path $path) {
+                Write-Output "Fixing permissions on $path"
+                # Grant full control to NonAdmin user
+                icacls $path /grant "NonAdmin:(OI)(CI)F" /T /Q
+                # Transfer ownership to NonAdmin
+                icacls $path /setowner "NonAdmin" /T /Q
+              }
+            }
+
+            Write-Output "Permissions fixed successfully"
+
+        - name: List installed extensions
+          win_shell: |
+            # Get NonAdmin profile path (may have suffix)
+            $profile = Get-WmiObject -Class Win32_UserProfile | Where-Object {
+              $_.LocalPath -like "*\NonAdmin*" -and -not $_.Special
+            } | Select-Object -First 1
+
+            if (-not $profile) {
+              Write-Error "NonAdmin profile not found"
+              exit 1
+            }
+            $profilePath = $profile.LocalPath
+
+            $extDir = Join-Path $profilePath ".vscode\extensions"
+            if (Test-Path $extDir) {
+              Write-Output "Extensions installed in $extDir"
+              Get-ChildItem $extDir -Directory | ForEach-Object { Write-Output "  - $($_.Name)" }
+            } else {
+              Write-Output "Extensions directory not found"
+            }
           register: installed_extensions
 
         - name: Display installed extensions
           debug:
-            msg: |
-              Extension installation completed successfully!
-              Installed extensions: {{ installed_extensions.stdout_lines }}
+            msg: "{{ installed_extensions.stdout_lines }}"
 
-        - name: Ensure clone root exists
-          win_file:
-            path: "{{ clone_root }}"
-            state: directory
-
-        - name: Clone repositories
+        - name: Clone GitHub repositories
           win_shell: |
-            $repos = @(@( {{ github_repos | map('to_json') | join(', ') }} ))
-            foreach ($repo in $repos) {
-              git clone $repo
+            # Get NonAdmin profile path (may have suffix)
+            $profile = Get-WmiObject -Class Win32_UserProfile | Where-Object {
+              $_.LocalPath -like "*\NonAdmin*" -and -not $_.Special
+            } | Select-Object -First 1
+
+            if (-not $profile) {
+              Write-Error "NonAdmin profile not found"
+              exit 1
             }
-          args:
-            chdir: "{{ clone_root }}"
-          ignore_errors: true
+            $profilePath = $profile.LocalPath
+            Write-Output "Using profile path: $profilePath"
+
+            # Create repos directory using actual profile path
+            $repoDir = Join-Path $profilePath "repos"
+            New-Item -Path $repoDir -ItemType Directory -Force | Out-Null
+
+            Set-Location $repoDir
+
+            $repos = @( {{ github_repos | map('to_json') | join(', ') }} )
+            foreach ($repo in $repos) {
+              $repoName = $repo.Split('/')[-1].Replace('.git','')
+              if (!(Test-Path "$repoDir\$repoName")) {
+                Write-Output "Cloning $repo..."
+                git clone $repo
+              } else {
+                Write-Output "Repository $repoName already exists, skipping"
+              }
+            }
+
+            Write-Output "Repository cloning complete"
+
+        - name: Fix permissions on repos directory
+          win_shell: |
+            # Get NonAdmin profile path (may have suffix)
+            $profile = Get-WmiObject -Class Win32_UserProfile | Where-Object {
+              $_.LocalPath -like "*\NonAdmin*" -and -not $_.Special
+            } | Select-Object -First 1
+
+            if ($profile) {
+              $profilePath = $profile.LocalPath
+              $reposDir = Join-Path $profilePath "repos"
+
+              if (Test-Path $reposDir) {
+                icacls $reposDir /grant "NonAdmin:(OI)(CI)F" /T /Q
+                icacls $reposDir /setowner "NonAdmin" /T /Q
+                Write-Output "Permissions fixed on repos directory: $reposDir"
+              }
+            }
 
         - name: Install WireGuard Windows client
           win_chocolatey:
@@ -984,7 +1280,6 @@
             # Start the tunnel
             Start-Service -Name $serviceName
           when: hostvars['localhost']['disable_http2'] | default(false) | bool and wg_config_content is defined
-          ignore_errors: true
 
         - name: Verify WireGuard tunnel is running
           win_shell: |
@@ -1422,10 +1717,16 @@
               - "Instance ID: {{ hostvars['localhost']['windows_instance_id'] | default('N/A') }}"
               - "Public IP: {{ hostvars['localhost']['windows_instance_ip'] | default('N/A') }}"
               - ""
-              - "RDP Connection:"
+              - "RDP Connection (Administrator):"
               - "  Address: {{ hostvars['localhost']['windows_instance_ip'] | default('N/A') }}:3389"
               - "  Username: Administrator"
               - "  Password: {{ hostvars['localhost']['windows_admin_password'] | default('N/A') }}"
+              - ""
+              - "RDP Connection (NonAdmin - Development User):"
+              - "  Address: {{ hostvars['localhost']['windows_instance_ip'] | default('N/A') }}:3389"
+              - "  Username: NonAdmin"
+              - "  Password: {{ hostvars['localhost']['nonadmin_password'] | default('N/A') }}"
+              - "  Note: VS Code, extensions, and repositories configured for this user"
               - ""
 
         - name: Add proxy information to summary
