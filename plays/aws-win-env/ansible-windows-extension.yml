@@ -109,10 +109,42 @@
           register: igw_result
           when: vpc_result.vpc.id is defined
 
+        - name: Get availability zones that support the instance type
+          command: >
+            aws ec2 describe-instance-type-offerings
+            --location-type availability-zone
+            --filters Name=instance-type,Values={{ ec2_instance_type }}
+            --region {{ aws_region }}
+            --query 'InstanceTypeOfferings[*].Location'
+            --output text
+          environment:
+            AWS_ACCESS_KEY_ID: "{{ aws_access_key_id }}"
+            AWS_SECRET_ACCESS_KEY: "{{ aws_secret_access_key }}"
+          register: supported_azs
+          changed_when: false
+
+        - name: Parse supported availability zones
+          set_fact:
+            available_zones: "{{ supported_azs.stdout.split() }}"
+
+        - name: Fail if no availability zones support this instance type
+          fail:
+            msg: "No availability zones in {{ aws_region }} support {{ ec2_instance_type }}"
+          when: available_zones | length == 0
+
+        - name: Select first available zone
+          set_fact:
+            selected_az: "{{ available_zones[0] }}"
+
+        - name: Display selected availability zone
+          debug:
+            msg: "Using availability zone {{ selected_az }} for {{ ec2_instance_type }}"
+
         - name: Create subnet
           amazon.aws.ec2_vpc_subnet:
             vpc_id: "{{ vpc_result.vpc.id }}"
             cidr: "10.0.1.0/24"
+            az: "{{ selected_az }}"
             region: "{{ aws_region }}"
             state: present
             map_public: true
@@ -603,7 +635,6 @@
   vars:
     windows_user: NonAdmin
     windows_password: "{{ ansible_password }}"
-    konveyor_extension_url: https://github.com/konveyor/editor-extensions/releases/download/v0.2.0-pre.2-1/konveyor-v0.2.0-pre.2-1.vsix
     github_repos:
     - https://github.com/konveyor-ecosystem/coolstore
     clone_root: "C:/Users/{{ windows_user }}/repos"
@@ -861,6 +892,27 @@
           win_shell: |
             $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH","User")
             [Environment]::SetEnvironmentVariable("PATH", $env:PATH, "Process")
+
+        - name: Get latest Konveyor extension release from GitHub
+          uri:
+            url: https://api.github.com/repos/konveyor/editor-extensions/releases/latest
+            method: GET
+            return_content: yes
+            headers:
+              Accept: application/vnd.github+json
+          register: latest_release
+          delegate_to: localhost
+          when: konveyor_extension_url is not defined
+
+        - name: Find VSIX asset in latest release
+          set_fact:
+            konveyor_extension_url: "{{ latest_release.json.assets | selectattr('name', 'match', '.*\\.vsix$') | map(attribute='browser_download_url') | first }}"
+          when: konveyor_extension_url is not defined and latest_release.json.assets is defined
+
+        - name: Display extension URL being used
+          debug:
+            msg: "Using extension URL: {{ konveyor_extension_url }}"
+          when: konveyor_extension_url is defined
 
         - name: Create temp directory if it doesn't exist
           win_file:
