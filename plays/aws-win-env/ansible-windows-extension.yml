@@ -253,7 +253,6 @@
               "tag:Name": "{{ instance_name }}"
               instance-state-name: ["pending","running", "stopping", "stopped"]
           register: existing_instance_check
-          ignore_errors: true
 
         - name: Launch EC2 instance
           amazon.aws.ec2_instance:
@@ -283,20 +282,24 @@
               Set-Item WSMan:\localhost\Client\TrustedHosts -Value "*" -Force
               
               # Configure WinRM listener and firewall rules
-              winrm quickconfig -q
+              winrm quickconfig -q -force
               winrm set winrm/config/winrs '@{MaxMemoryPerShellMB="1024"}'
               winrm set winrm/config '@{MaxTimeoutms="1800000"}'
-              winrm set winrm/config/service '@{AllowUnencrypted="true"}'
-              winrm set winrm/config/service/auth '@{Basic="true"}'
+
+              # Create self-signed certificate for HTTPS
+              $cert = New-SelfSignedCertificate -DnsName "winrm-ec2" -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(5)
+
+              # Create HTTPS listener
+              New-Item -Path WSMan:\localhost\Listener -Transport HTTPS -Address * -CertificateThumbprint $cert.Thumbprint -Force
+
+              # Enable CredSSP authentication (optional, but useful for double-hop scenarios)
+              winrm set winrm/config/service/auth '@{CredSSP="true"}'
               
               # Configure Windows Firewall to allow WinRM
               netsh advfirewall firewall set rule name="Windows Remote Management (HTTP-In)" new enable=yes
               netsh advfirewall firewall add rule name="WinRM-HTTP" dir=in action=allow protocol=TCP localport=5985
               netsh advfirewall firewall add rule name="WinRM-HTTPS" dir=in action=allow protocol=TCP localport=5986
-              
-              # Alternative: Disable Windows Firewall for testing (less secure but ensures connectivity)
-              netsh advfirewall set allprofiles state off
-              
+
               # Enable RDP explicitly
               Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
               Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
@@ -326,7 +329,6 @@
               "tag:Name": "{{ instance_name }}"
               instance-state-name: ["running"]
           register: existing_instance_check
-          ignore_errors: true
 
         - name: Use existing instance if available and running
           set_fact:
@@ -374,8 +376,9 @@
             ansible_password: "{{ admin_pw.win_password }}"
             ansible_connection: winrm
             ansible_winrm_transport: ntlm
+            ansible_winrm_server_cert_validation: ignore
             ansible_winrm_message_encryption: auto
-            ansible_port: 5985
+            ansible_port: 5986
             ansible_winrm_operation_timeout_sec: 60
             ansible_winrm_read_timeout_sec: 100
             instance_id: "{{ instance_id }}"
@@ -544,7 +547,7 @@
           async_status:
             jid: "{{ mitmproxy_startup.ansible_job_id }}"
           register: mitmproxy_job_result
-          ignore_errors: yes
+          failed_when: false
 
         - name: Extract WireGuard client configuration from mitmproxy log
           shell: grep -A 8 '\[Interface\]' /tmp/mitmproxy-startup.log > /tmp/wireguard-client.conf
@@ -589,14 +592,12 @@
           wait_for:
             path: /root/.mitmproxy/mitmproxy-ca-cert.cer
             timeout: 30
-          ignore_errors: yes
 
         - name: Fetch mitmproxy CA certificate to localhost
           fetch:
             src: /root/.mitmproxy/mitmproxy-ca-cert.cer
             dest: ./mitmproxy-ca-cert.cer
             flat: yes
-          ignore_errors: yes
 
         - name: Create mitmproxy systemd service
           copy:
@@ -981,35 +982,29 @@
           register: vsix_file_check
           when: konveyor_extension_url is defined
 
-        - name: Download redhat.java extension VSIX
+        - name: Create reusable VSIX installation function
           win_shell: |
-            $url = "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/redhat/vsextensions/java/latest/vspackage"
-            $dest = "C:\temp\redhat.java.vsix"
-            Write-Output "Downloading from $url"
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing -MaximumRedirection 5
-            Write-Output "Download complete. File size: $((Get-Item $dest).Length) bytes"
+            # Define the function in a file so it can be reused
+            $functionDef = @'
+            function Install-VSCodeExtension {
+              param(
+                [Parameter(Mandatory=$true)]
+                [string]$VsixPath,
+                [Parameter(Mandatory=$true)]
+                [string]$ProfilePath
+              )
 
-        - name: Extract redhat.java extension
-          win_shell: |
-            $profile = Get-WmiObject -Class Win32_UserProfile | Where-Object {
-              $_.LocalPath -like "*\NonAdmin*" -and -not $_.Special
-            } | Select-Object -First 1
+              $extensionName = [System.IO.Path]::GetFileNameWithoutExtension($VsixPath)
+              $zipPath = "C:\temp\$extensionName.zip"
+              $tempExtract = "C:\temp\$extensionName-extracted"
 
-            if (-not $profile) {
-              Write-Error "NonAdmin profile not found"
-              exit 1
-            }
-            $profilePath = $profile.LocalPath
-            Write-Output "Using profile path: $profilePath"
+              if (-not (Test-Path $VsixPath)) {
+                Write-Output "VSIX file not found at $VsixPath, skipping"
+                return
+              }
 
-            $vsixPath = "C:\temp\redhat.java.vsix"
-            $zipPath = "C:\temp\redhat.java.zip"
-            $tempExtract = "C:\temp\redhat-java-extracted"
-
-            if (Test-Path $vsixPath) {
-              Write-Output "Renaming VSIX to ZIP for extraction"
-              Copy-Item -Path $vsixPath -Destination $zipPath -Force
+              Write-Output "Processing VSIX: $VsixPath"
+              Copy-Item -Path $VsixPath -Destination $zipPath -Force
 
               Write-Output "Extracting ZIP from $zipPath to $tempExtract"
               Expand-Archive -Path $zipPath -DestinationPath $tempExtract -Force
@@ -1025,7 +1020,7 @@
                 $sourceDir = $tempExtract
               } else {
                 Write-Error "Could not find package.json in extracted VSIX"
-                exit 1
+                return
               }
 
               Write-Output "Reading package.json from: $packageJsonPath"
@@ -1036,7 +1031,7 @@
 
               Write-Output "Extension: $publisher.$name version $version"
 
-              $extensionsDir = Join-Path $profilePath ".vscode\extensions"
+              $extensionsDir = Join-Path $ProfilePath ".vscode\extensions"
               New-Item -Path $extensionsDir -ItemType Directory -Force | Out-Null
               Write-Output "Created extensions directory: $extensionsDir"
 
@@ -1050,13 +1045,23 @@
 
               Write-Output "Verifying installation:"
               Get-ChildItem $extDir | Select-Object Name | ForEach-Object { Write-Output "  - $($_.Name)" }
-            } else {
-              Write-Error "VSIX file not found at $vsixPath"
-              exit 1
             }
+            '@
+            Set-Content -Path "C:\temp\Install-VSCodeExtension.ps1" -Value $functionDef
+            Write-Output "VSIX installation function created"
 
-        - name: Extract konveyor extension if present
+        - name: Download redhat.java extension VSIX
           win_shell: |
+            $url = "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/redhat/vsextensions/java/latest/vspackage"
+            $dest = "C:\temp\redhat.java.vsix"
+            Write-Output "Downloading from $url"
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing -MaximumRedirection 5
+            Write-Output "Download complete. File size: $((Get-Item $dest).Length) bytes"
+
+        - name: Install redhat.java extension
+          win_shell: |
+            # Get NonAdmin profile path
             $profile = Get-WmiObject -Class Win32_UserProfile | Where-Object {
               $_.LocalPath -like "*\NonAdmin*" -and -not $_.Special
             } | Select-Object -First 1
@@ -1066,58 +1071,27 @@
               exit 1
             }
             $profilePath = $profile.LocalPath
-            Write-Output "Using profile path: $profilePath"
 
-            $vsixPath = "C:\temp\konveyor-extension.vsix"
-            $zipPath = "C:\temp\konveyor-extension.zip"
-            $tempExtract = "C:\temp\konveyor-extracted"
+            # Load and call the reusable function
+            . C:\temp\Install-VSCodeExtension.ps1
+            Install-VSCodeExtension -VsixPath "C:\temp\redhat.java.vsix" -ProfilePath $profilePath
 
-            if (Test-Path $vsixPath) {
-              Write-Output "Renaming Konveyor VSIX to ZIP for extraction"
-              Copy-Item -Path $vsixPath -Destination $zipPath -Force
+        - name: Install konveyor extension if present
+          win_shell: |
+            # Get NonAdmin profile path
+            $profile = Get-WmiObject -Class Win32_UserProfile | Where-Object {
+              $_.LocalPath -like "*\NonAdmin*" -and -not $_.Special
+            } | Select-Object -First 1
 
-              Write-Output "Extracting ZIP from $zipPath to $tempExtract"
-              Expand-Archive -Path $zipPath -DestinationPath $tempExtract -Force
-
-              Write-Output "Extracted VSIX structure:"
-              Get-ChildItem $tempExtract -Recurse -Depth 2 | Select-Object FullName | ForEach-Object { Write-Output $_.FullName }
-
-              if (Test-Path "$tempExtract\extension\package.json") {
-                $packageJsonPath = "$tempExtract\extension\package.json"
-                $sourceDir = "$tempExtract\extension"
-              } elseif (Test-Path "$tempExtract\package.json") {
-                $packageJsonPath = "$tempExtract\package.json"
-                $sourceDir = $tempExtract
-              } else {
-                Write-Error "Could not find package.json in extracted Konveyor VSIX"
-                exit 1
-              }
-
-              Write-Output "Reading package.json from: $packageJsonPath"
-              $packageJson = Get-Content $packageJsonPath -Raw | ConvertFrom-Json
-              $publisher = $packageJson.publisher
-              $name = $packageJson.name
-              $version = $packageJson.version
-
-              Write-Output "Extension: $publisher.$name version $version"
-
-              $extensionsDir = Join-Path $profilePath ".vscode\extensions"
-              New-Item -Path $extensionsDir -ItemType Directory -Force | Out-Null
-              Write-Output "Created extensions directory: $extensionsDir"
-
-              $extDir = Join-Path $extensionsDir "$publisher.$name-$version"
-              New-Item -Path $extDir -ItemType Directory -Force | Out-Null
-              Write-Output "Created extension directory: $extDir"
-
-              Write-Output "Copying from $sourceDir to $extDir"
-              Copy-Item -Path "$sourceDir\*" -Destination $extDir -Recurse -Force
-              Write-Output "Successfully installed $publisher.$name version $version"
-
-              Write-Output "Verifying installation:"
-              Get-ChildItem $extDir | Select-Object Name | ForEach-Object { Write-Output "  - $($_.Name)" }
-            } else {
-              Write-Output "Konveyor VSIX not found at $vsixPath, skipping"
+            if (-not $profile) {
+              Write-Error "NonAdmin profile not found"
+              exit 1
             }
+            $profilePath = $profile.LocalPath
+
+            # Load and call the reusable function
+            . C:\temp\Install-VSCodeExtension.ps1
+            Install-VSCodeExtension -VsixPath "C:\temp\konveyor-extension.vsix" -ProfilePath $profilePath
 
         - name: Create VSCode settings.json for NonAdmin
           win_shell: |
@@ -1352,7 +1326,7 @@
             & "C:\Program Files\WireGuard\wireguard.exe" /dumplog $tunnelName 2>&1 | Select-Object -Last 10
           when: hostvars['localhost']['disable_http2'] | default(false) | bool and wg_config_content is defined
           register: wg_status
-          ignore_errors: true
+          failed_when: false
 
         - name: Display WireGuard tunnel status
           debug:
@@ -1445,7 +1419,6 @@
               "tag:Name": "{{ resource_prefix }}-instance"
               instance-state-name: ["pending", "running", "stopped", "stopping"]
           register: instance_lookup
-          ignore_errors: true
 
         - name: Lookup proxy EC2 instance by name
           amazon.aws.ec2_instance_info:
@@ -1454,7 +1427,6 @@
               "tag:Name": "{{ resource_prefix }}-proxy-instance"
               instance-state-name: ["pending", "running", "stopped", "stopping"]
           register: proxy_instance_lookup
-          ignore_errors: true
 
         - name: Lookup VPC by name
           amazon.aws.ec2_vpc_net_info:
@@ -1462,7 +1434,6 @@
             filters:
               "tag:Name": "{{ resource_prefix }}-vpc"
           register: vpc_lookup
-          ignore_errors: true
 
         - name: Lookup security group by name
           amazon.aws.ec2_security_group_info:
@@ -1470,7 +1441,6 @@
             filters:
               group-name: "{{ resource_prefix }}-sg"
           register: sg_lookup
-          ignore_errors: true
 
         - name: Lookup proxy security group by name
           amazon.aws.ec2_security_group_info:
@@ -1478,7 +1448,6 @@
             filters:
               group-name: "{{ resource_prefix }}-proxy-sg"
           register: proxy_sg_lookup
-          ignore_errors: true
 
         - name: Lookup subnet by name
           amazon.aws.ec2_vpc_subnet_info:
@@ -1486,7 +1455,6 @@
             filters:
               "tag:Name": "{{ resource_prefix }}-subnet"
           register: subnet_lookup
-          ignore_errors: true
 
         - name: Lookup route table by name
           amazon.aws.ec2_vpc_route_table_info:
@@ -1494,7 +1462,6 @@
             filters:
               "tag:Name": "{{ resource_prefix }}-rt"
           register: rt_lookup
-          ignore_errors: true
 
         # Set resource IDs from lookups
         - name: Set resource IDs from lookups
@@ -1505,6 +1472,7 @@
             found_sg_id: "{{ sg_lookup.security_groups[0].group_id if (sg_lookup.security_groups is defined and sg_lookup.security_groups | length > 0) else '' }}"
             found_proxy_sg_id: "{{ proxy_sg_lookup.security_groups[0].group_id if (proxy_sg_lookup.security_groups is defined and proxy_sg_lookup.security_groups | length > 0) else '' }}"
             found_subnet_id: "{{ subnet_lookup.subnets[0].subnet_id if (subnet_lookup.subnets is defined and subnet_lookup.subnets | length > 0) else '' }}"
+            found_subnet_cidr: "{{ subnet_lookup.subnets[0].cidr_block if (subnet_lookup.subnets is defined and subnet_lookup.subnets | length > 0) else '' }}"
             found_rt_id: "{{ rt_lookup.route_tables[0].route_table_id if (rt_lookup.route_tables is defined and rt_lookup.route_tables | length > 0) else '' }}"
 
         - name: Display found resources
@@ -1517,6 +1485,7 @@
               - Security Group ID: {{ found_sg_id | default('Not found') }}
               - Proxy Security Group ID: {{ found_proxy_sg_id | default('Not found') }}
               - Subnet ID: {{ found_subnet_id | default('Not found') }}
+              - Subnet CIDR: {{ found_subnet_cidr | default('Not found') }}
               - Route Table ID: {{ found_rt_id | default('Not found') }}
 
         - name: Terminate EC2 instance
@@ -1529,7 +1498,6 @@
             wait_timeout: 300
           when: found_instance_id != ""
           register: instance_cleanup
-          ignore_errors: true
         
         - name: Track instance cleanup
           set_fact:
@@ -1552,7 +1520,6 @@
             wait_timeout: 300
           when: found_proxy_instance_id != ""
           register: proxy_instance_cleanup
-          ignore_errors: true
 
         - name: Track proxy instance cleanup
           set_fact:
@@ -1572,7 +1539,6 @@
             state: absent
           when: cleanup_resources | bool
           register: keypair_cleanup
-          ignore_errors: true
         
         - name: Track key pair cleanup
           set_fact:
@@ -1592,7 +1558,6 @@
             state: absent
           when: cleanup_resources | bool and found_sg_id != ""
           register: sg_cleanup
-          ignore_errors: true
         
         - name: Track security group cleanup
           set_fact:
@@ -1612,7 +1577,6 @@
             state: absent
           when: cleanup_resources | bool and found_proxy_sg_id != ""
           register: proxy_sg_cleanup
-          ignore_errors: true
 
         - name: Track proxy security group cleanup
           set_fact:
@@ -1633,7 +1597,6 @@
             lookup: id
           when: cleanup_resources | bool and found_rt_id != ""
           register: rt_cleanup
-          ignore_errors: true
         
         - name: Track route table cleanup
           set_fact:
@@ -1651,10 +1614,9 @@
             region: "{{ aws_region }}"
             state: absent
             vpc_id: "{{ found_vpc_id }}"
-            cidr: "10.0.1.0/24"
-          when: cleanup_resources | bool and found_subnet_id != "" and found_vpc_id != ""
+            cidr: "{{ found_subnet_cidr }}"
+          when: cleanup_resources | bool and found_subnet_id != "" and found_vpc_id != "" and found_subnet_cidr != ""
           register: subnet_cleanup
-          ignore_errors: true
         
         - name: Track subnet cleanup
           set_fact:
@@ -1674,7 +1636,6 @@
             state: absent
           when: cleanup_resources | bool and found_vpc_id != ""
           register: igw_cleanup
-          ignore_errors: true
         
         - name: Track IGW cleanup
           set_fact:
@@ -1694,7 +1655,6 @@
             state: absent
           when: cleanup_resources | bool and found_vpc_id != ""
           register: vpc_cleanup
-          ignore_errors: true
         
         - name: Track VPC cleanup
           set_fact:
@@ -1712,7 +1672,6 @@
             path: "./{{ resource_prefix }}-keypair.pem"
             state: absent
           when: cleanup_resources | bool
-          ignore_errors: true
 
         - name: Display cleanup completion
           debug:
