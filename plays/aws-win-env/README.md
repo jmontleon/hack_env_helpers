@@ -23,6 +23,7 @@ ansible-playbook ./ansible-windows-extension.yml \
   -e aws_access_key_id=$AWS_ACCESS_KEY_ID \
   -e aws_secret_access_key=$AWS_SECRET_ACCESS_KEY \
   -e gh_token=$GH_TOKEN \
+  -e user_email=$EMAIL_ADDRESS \
   -e action=deploy \
   -e guid=$USER-win2025 \
   -e disable_http2=true
@@ -34,6 +35,7 @@ ansible-playbook ./ansible-windows-extension.yml \
   -e aws_access_key_id=$AWS_ACCESS_KEY_ID \
   -e aws_secret_access_key=$AWS_SECRET_ACCESS_KEY \
   -e gh_token=$GH_TOKEN \
+  -e user_email=$EMAIL_ADDRESS \
   -e action=deploy \
   -e guid=$USER-win2025 \
   -e disable_http2=true \
@@ -46,6 +48,7 @@ ansible-playbook ./ansible-windows-extension.yml \
   -e aws_access_key_id=$AWS_ACCESS_KEY_ID \
   -e aws_secret_access_key=$AWS_SECRET_ACCESS_KEY \
   -e gh_token=$GH_TOKEN \
+  -e user_email=$EMAIL_ADDRESS \
   -e action=cleanup \
   -e guid=$USER-win2025 \
   -e disable_http2=true
