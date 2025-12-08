@@ -13,8 +13,15 @@ sudo dnf -y install ansible awscli python3-winrm python3-boto3
 
 On other platforms:
 ```bash
-pip install ansible pywinrm
+pip install ansible pywinrm boto3
 ansible-galaxy collection install amazon.aws
+```
+
+In addition to the above install awscli with your distro/OS package manager or following [Amazon documentation](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
+
+On macOS:
+```bash
+brew install awscli
 ```
 
 ## Usage:
