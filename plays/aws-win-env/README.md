@@ -8,7 +8,7 @@ This playbook is intended to provide an easily deployable Windows instance in AW
 ## Prerequisites
 If on Fedora:
 ```bash
-sudo dnf -y install ansible python3-winrm python3-boto3
+sudo dnf -y install ansible awscli python3-winrm python3-boto3
 ```
 
 On other platforms:
