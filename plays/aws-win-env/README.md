@@ -50,7 +50,7 @@ ansible-playbook ./ansible-windows-extension.yml \
 ```
 
 ## Accessing Proxy Logs
-The proxy is run as a service on the proxy host. In order to follow the logs connect to the proxy host
+The proxy is run as a service on the proxy host. To follow the logs connect to the proxy host
 ```bash
 ssh -i $guid-keypair.pem ec2-user@<ip address>
 ```
