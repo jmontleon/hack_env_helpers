@@ -42,6 +42,17 @@ ansible-playbook ./ansible-windows-extension.yml \
   -e https://github.com/migtools/editor-extensions/releases/download/development-builds/mta-vscode-extension-8.0.0-dev.20251124223200.c332c41.vsix
 ```
 
+## Accessing Proxy Logs
+The proxy is run as a service on the proxy host. In order to follow the logs connect to the proxy host
+```bash
+ssh -i $guid-keypair.pem ec2-user@<ip address>
+```
+
+And follow the logs
+```bash
+sudo journalctl -b 0 -u mitmproxy-wireguard -f
+```
+
 ## To clean up
 ```bash
 ansible-playbook ./ansible-windows-extension.yml \
