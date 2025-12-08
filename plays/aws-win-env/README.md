@@ -25,6 +25,11 @@ brew install awscli
 ```
 
 ## Usage:
+On macOS before proceeding run
+```bash
+export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
+```
+
 ```bash
 ansible-playbook ./ansible-windows-extension.yml \
   -e aws_access_key_id=$AWS_ACCESS_KEY_ID \
