@@ -56,32 +56,32 @@
           debug:
             msg: "Using Windows AMI: {{ ec2_image_id }} ({{ (windows_ami_info.images | sort(attribute='creation_date') | last).name }})"
 
-        - name: Get latest Fedora AMI for proxy
+        - name: Get latest CentOS AMI for proxy
           amazon.aws.ec2_ami_info:
             region: "{{ aws_region }}"
             owners:
-              - "125523088429"  # Fedora
+              - "125523088429"  # CentOS
             filters:
-              name: "Fedora-Cloud-Base-*"
+              name: "CentOS Stream 10*"
               architecture: x86_64
               virtualization-type: hvm
               state: available
-          register: fedora_ami_info
+          register: centos_ami_info
           when: disable_http2 | bool
 
-        - name: Fail if no Fedora AMI found
+        - name: Fail if no CentOS AMI found
           fail:
-            msg: "No Fedora AMI found in {{ aws_region }}. Please check the region or use a different Linux distribution."
-          when: disable_http2 | bool and (fedora_ami_info.images | default([]) | length == 0)
+            msg: "No CentOS AMI found in {{ aws_region }}. Please check the region or use a different Linux distribution."
+          when: disable_http2 | bool and (centos_ami_info.images | default([]) | length == 0)
 
-        - name: Set Fedora AMI ID
+        - name: Set CentOS AMI ID
           set_fact:
-            proxy_image_id: "{{ (fedora_ami_info.images | sort(attribute='creation_date') | last).image_id }}"
-          when: disable_http2 | bool and (fedora_ami_info.images | default([]) | length > 0)
+            proxy_image_id: "{{ (centos_ami_info.images | sort(attribute='creation_date') | last).image_id }}"
+          when: disable_http2 | bool and (centos_ami_info.images | default([]) | length > 0)
 
-        - name: Display selected Fedora AMI
+        - name: Display selected CentOS AMI
           debug:
-            msg: "Using Fedora AMI for proxy: {{ proxy_image_id }} ({{ (fedora_ami_info.images | sort(attribute='creation_date') | last).name }})"
+            msg: "Using CentOS AMI for proxy: {{ proxy_image_id }} ({{ (centos_ami_info.images | sort(attribute='creation_date') | last).name }})"
           when: disable_http2 | bool and proxy_image_id is defined
 
         - name: Create VPC
@@ -426,7 +426,7 @@
             hostname: "{{ proxy_instance_ip }}"
             groupname: proxy_hosts
             ansible_host: "{{ proxy_instance_ip }}"
-            ansible_user: fedora
+            ansible_user: ec2-user
             ansible_ssh_private_key_file: "./{{ key_pair_name }}.pem"
             ansible_connection: ssh
             ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
