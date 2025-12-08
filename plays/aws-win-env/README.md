@@ -46,7 +46,7 @@ ansible-playbook ./ansible-windows-extension.yml \
   -e action=deploy \
   -e guid=$USER-win2025 \
   -e disable_http2=true \
-  -e https://github.com/migtools/editor-extensions/releases/download/development-builds/mta-vscode-extension-8.0.0-dev.20251124223200.c332c41.vsix
+  -e konveyor_extension_url=https://github.com/migtools/editor-extensions/releases/download/development-builds/mta-vscode-extension-8.0.0-dev.20251124223200.c332c41.vsix
 ```
 
 ## Accessing Proxy Logs
