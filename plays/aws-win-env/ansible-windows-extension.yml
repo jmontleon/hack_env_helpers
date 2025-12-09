@@ -1126,10 +1126,58 @@
             }
 
             if ($javaHome -and (Test-Path $javaHome)) {
+              # Detect Java major version
+              $javaMajorVersion = $null
+
+              # Method 1: Try to parse from directory name first (most reliable for Chocolatey installs)
+              Write-Output "Attempting to detect Java version from path: $javaHome"
+
+              # Match patterns like: jdk-25, jdk-25.0.1, openjdk-25, jdk25, etc.
+              if ($javaHome -match '(?:jdk|openjdk)[-_]?(\d+)(?:[.-]\d+)*') {
+                $javaMajorVersion = $matches[1]
+                Write-Output "Extracted version $javaMajorVersion from directory name"
+              }
+
+              # Method 2: If that failed, try running java -version
+              if (-not $javaMajorVersion) {
+                Write-Output "Could not extract version from path, trying java -version command"
+                try {
+                  $javaExe = Join-Path (Join-Path $javaHome 'bin') 'java.exe'
+                  if (Test-Path $javaExe) {
+                    # Use constrained heap to avoid G1 reservation issues
+                    $versionOutput = & $javaExe -Xms64m -Xmx256m -version 2>&1 | Out-String
+                    Write-Output "Java version output: $versionOutput"
+
+                    # Parse version from output like 'openjdk version "25.0.1"' or 'java version "1.8.0_292"'
+                    if ($versionOutput -match 'version\s+"?(\d+)\.?(\d*)') {
+                      $major = $matches[1]
+                      # Handle old versioning scheme (1.8.x -> 8)
+                      if ($major -eq '1' -and $matches[2]) {
+                        $javaMajorVersion = $matches[2]
+                      } else {
+                        $javaMajorVersion = $major
+                      }
+                      Write-Output "Parsed version $javaMajorVersion from java -version output"
+                    }
+                  }
+                } catch {
+                  Write-Output "Failed to run java -version: $_"
+                }
+              }
+
+              # Construct runtime name with version
+              if ($javaMajorVersion) {
+                $runtimeName = "JavaSE-$javaMajorVersion"
+                Write-Output "Using runtime name: $runtimeName"
+              } else {
+                Write-Output "WARNING: Could not detect Java version, using generic 'JavaSE' (this may cause issues)"
+                $runtimeName = "JavaSE"
+              }
+
               $settings["java.jdt.ls.java.home"] = $javaHome
               $settings["java.configuration.runtimes"] = @(
                 @{
-                  name = "JavaSE"
+                  name = $runtimeName
                   path = $javaHome
                 }
               )
