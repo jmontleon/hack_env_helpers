@@ -1415,6 +1415,50 @@
             msg: "{{ ca_install_result.stdout_lines }}"
           when: hostvars['localhost']['disable_http2'] | default(false) | bool and ca_install_result is defined and ca_install_result.stdout_lines is defined
 
+        - name: Import mitmproxy CA certificate into JDK truststore
+          win_shell: |
+            # Get JAVA_HOME from environment
+            $javaHome = [Environment]::GetEnvironmentVariable('JAVA_HOME','Machine')
+
+            if (-not $javaHome -or -not (Test-Path $javaHome)) {
+              Write-Error "JAVA_HOME not found or invalid: $javaHome"
+              exit 1
+            }
+
+            $securityDir = Join-Path $javaHome "lib\security"
+            if (-not (Test-Path $securityDir)) {
+              Write-Error "JDK security directory not found: $securityDir"
+              exit 1
+            }
+
+            Write-Output "JDK security directory: $securityDir"
+
+            # Change to security directory and run keytool
+            Set-Location $securityDir
+
+            $keytoolPath = Join-Path (Join-Path $javaHome "bin") "keytool.exe"
+            if (-not (Test-Path $keytoolPath)) {
+              Write-Error "keytool not found: $keytoolPath"
+              exit 1
+            }
+
+            Write-Output "Importing mitmproxy CA certificate into JDK truststore..."
+            & $keytoolPath -import -trustcacerts -keystore cacerts -storepass changeit -noprompt -alias mitmproxy -file C:\temp\mitmproxy-ca-cert.cer
+
+            if ($LASTEXITCODE -eq 0) {
+              Write-Output "Successfully imported mitmproxy CA certificate into JDK truststore"
+            } else {
+              Write-Error "Failed to import certificate. Exit code: $LASTEXITCODE"
+              exit $LASTEXITCODE
+            }
+          when: hostvars['localhost']['disable_http2'] | default(false) | bool and mitm_ca_stat.stat.exists
+          register: jdk_ca_import_result
+
+        - name: Display JDK CA certificate import result
+          debug:
+            msg: "{{ jdk_ca_import_result.stdout_lines }}"
+          when: hostvars['localhost']['disable_http2'] | default(false) | bool and jdk_ca_import_result is defined and jdk_ca_import_result.stdout_lines is defined
+
       when: hostvars['localhost']['action'] == "deploy"
 
 - name: Cleanup AWS resources
